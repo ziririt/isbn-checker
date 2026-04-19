@@ -38,7 +38,9 @@ const { useState, useCallback, useRef, useMemo } = React;
  * → 타임아웃을 짧게 잡아 빠르게 실패하고 사용자에게 안내.
  * → python3 -m http.server 8080 으로 서빙하면 SEARCH_MS 타임아웃 사용.
  */
-const IS_FILE = window.location.protocol === 'file:';
+const IS_FILE    = window.location.protocol === 'file:';
+// localhost가 아닌 웹 환경 = Netlify Functions 프록시 사용
+const IS_NETLIFY = !IS_FILE && !['localhost','127.0.0.1'].includes(window.location.hostname);
 
 // JSONP 타임아웃 + CORS 프록시 폴백 타임아웃
 const LOOKUP_MS = IS_FILE ? 10000 : 15000;
@@ -163,18 +165,58 @@ function callAladin(endpoint, params, ms, key = ALADIN_KEY) {
 }
 
 /**
+ * Netlify 환경 전용: /.netlify/functions/aladin 서버리스 프록시 경유 호출.
+ * 서버에서 알라딘을 호출하므로 Referer 차단 없음, CORS 문제 없음.
+ *
+ * 개선점:
+ * - AbortController를 키별로 독립 생성 (공유 시 타이머 충돌 문제 제거)
+ * - Netlify 무료 플랜은 10s 한도 → 클라이언트 타임아웃을 9s로 제한
+ * - 1차 키 실패(HTTP 오류 포함) 시 2차 키로 자동 재시도
+ */
+async function callAladinViaFunction(endpoint, params, ms) {
+  const epName = endpoint.includes('ItemLookUp') ? 'ItemLookUp.aspx' : 'ItemSearch.aspx';
+  // Netlify 무료 함수 실행 한도(10s)를 고려해 클라이언트 타임아웃 상한 설정
+  const effectiveMs = Math.min(ms, 9000);
+
+  const doFetch = async (key) => {
+    const qs = new URLSearchParams({ _ep: epName, ttbkey: key, ...params }).toString();
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), effectiveMs);
+    try {
+      const res = await fetch(`/.netlify/functions/aladin?${qs}`, { signal: ctrl.signal });
+      if (!res.ok) throw new Error('HTTP_' + res.status);
+      const data = await res.json();
+      if (data && data.errorCode) throw new Error('API_ERR_' + data.errorCode);
+      return data;
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error('TIMEOUT');
+      throw e;
+    } finally {
+      clearTimeout(tid);
+    }
+  };
+
+  // 1차 키 시도 → 실패 시 2차 키 재시도 (타임아웃 포함 모든 오류)
+  try {
+    return await doFetch(ALADIN_KEY);
+  } catch (_) {
+    return doFetch(ALADIN_KEY_SUB);
+  }
+}
+
+/**
  * 1차 키 실패(NET_ERR · errorCode) 시 2차 키로 자동 재시도.
+ * Netlify 환경에서는 서버리스 함수 경유.
  * TIMEOUT은 키 문제가 아니므로 즉시 throw.
  */
 async function callAladinFallback(endpoint, params, ms) {
+  if (IS_NETLIFY) return callAladinViaFunction(endpoint, params, ms);
   try {
     const r = await callAladin(endpoint, params, ms, ALADIN_KEY);
-    // errorCode가 있으면 API 키 거부 → 2차 키 시도
     if (r && r.errorCode) throw new Error('API_ERR');
     return r;
   } catch (e) {
-    if (e.message === 'TIMEOUT') throw e;  // 타임아웃은 키 교체로 해결 안 됨
-    // NET_ERR / API_ERR → 2차 키 재시도
+    if (e.message === 'TIMEOUT') throw e;
     return callAladin(endpoint, params, ms, ALADIN_KEY_SUB);
   }
 }
@@ -426,6 +468,22 @@ async function _trySearch(query, queryType, ms) {
     SearchTarget: 'Book', MaxResults: 10, start: 1, Sort: 'Accuracy',
   };
 
+  // Netlify: 서버리스 함수 직접 호출 (Referer 차단 없음)
+  // 1차 시도 실패 시 400ms 대기 후 1회 재시도 → 일시적 과부하/율제한 대응
+  if (IS_NETLIFY) {
+    try {
+      const r = await callAladinViaFunction(ALADIN_SEARCH, searchParams, ms);
+      if (r && !r.errorCode) return r;
+    } catch (_) {}
+    // 재시도
+    await delay(400);
+    try {
+      return await callAladinViaFunction(ALADIN_SEARCH, searchParams, ms);
+    } catch (_) {
+      return null;
+    }
+  }
+
   if (IS_FILE) {
     // 레이스: 1차 키 JSONP + 프록시 동시 실행, 먼저 오는 것 사용
     return raceNonNull([
@@ -434,12 +492,11 @@ async function _trySearch(query, queryType, ms) {
     ]);
   }
 
-  // HTTP: 1차 키 JSONP → 실패 시 2차 키 JSONP → 모두 실패 시 프록시(1차→2차)
+  // localhost HTTP: 1차 키 JSONP → 실패 시 2차 키 → 모두 실패 시 프록시
   try {
     const r = await callAladinFallback(ALADIN_SEARCH, searchParams, ms);
     if (r && !r.errorCode) return r;
   } catch (_) {}
-  // 프록시도 1차 키 먼저, 실패 시 2차 키
   const p1 = await _searchViaProxy(query, queryType, PROXY_MS, ALADIN_KEY).catch(() => null);
   if (p1 && !p1.errorCode) return p1;
   return _searchViaProxy(query, queryType, PROXY_MS, ALADIN_KEY_SUB);
@@ -1646,26 +1703,36 @@ function App() {
         <ApiFailBanner count={stats.apiFail} />
 
         {/* 컨트롤 바 */}
-        <div className="bg-white rounded-xl border border-slate-200 px-4 py-3 flex flex-wrap items-center gap-3">
-          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.tsv,.txt,.html,.htm" onChange={onFile} className="hidden" />
-          <button onClick={()=>fileRef.current?.click()}
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-semibold hover:bg-blue-700 transition-colors">
-            엑셀 파일 업로드
-          </button>
+        <div className="bg-white rounded-xl border border-slate-200 px-4 py-4 space-y-3">
+          {/* 상단: 업로드 버튼 + 슬라이더 */}
+          <div className="flex flex-wrap items-center gap-3">
+            <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.tsv,.txt,.html,.htm" onChange={onFile} className="hidden" />
+            <button onClick={()=>fileRef.current?.click()}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-semibold hover:bg-blue-700 transition-colors">
+              엑셀 파일 업로드
+            </button>
+            {rows.length>0 && <ThresholdInfo threshold={threshold} onChange={setThreshold} />}
+          </div>
+
+          {/* 하단: 검증 시작 버튼 — 페이지 핵심 액션, 크게 중앙 배치 */}
           {rows.length>0 && (
-            <>
-              <div className="h-5 w-px bg-slate-200" />
+            <div className="flex justify-center pt-1">
               <button onClick={verifyAll} disabled={processing||stats.pending+stats.failed===0}
-                className={`px-7 py-2.5 text-white rounded-xl text-base font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed
+                className={`w-full max-w-lg py-5 text-white rounded-2xl text-2xl font-black tracking-tight transition-all shadow-lg disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none
                   ${!processing && stats.pending+stats.failed>0
-                    ? 'btn-verify-active bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 shadow-md hover:shadow-lg'
-                    : 'bg-emerald-600 hover:bg-emerald-700'}`}>
+                    ? 'btn-verify-active bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 hover:shadow-xl'
+                    : 'bg-emerald-600'}`}>
                 {processing
-                  ? <span className="flex items-center gap-2"><svg className="spin h-4 w-4" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" opacity="0.25"/><path fill="currentColor" opacity="0.75" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg> 검증 처리 중...</span>
-                  : `▶ 미처리 ${stats.pending+stats.failed}건 검증 시작`}
+                  ? <span className="flex items-center justify-center gap-3">
+                      <svg className="spin h-6 w-6" viewBox="0 0 24 24" fill="none">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" opacity="0.25"/>
+                        <path fill="currentColor" opacity="0.75" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                      </svg>
+                      검증 처리 중...
+                    </span>
+                  : `▶  미처리 ${stats.pending+stats.failed}건 검증 시작`}
               </button>
-              <ThresholdInfo threshold={threshold} onChange={setThreshold} />
-            </>
+            </div>
           )}
         </div>
 
@@ -1715,10 +1782,20 @@ function App() {
                   </button>
                 ))}
               </div>
-              <button onClick={dlAll}
-                className={`mx-auto px-6 py-2.5 bg-gradient-to-r from-green-600 to-emerald-600 text-white text-sm font-extrabold rounded-xl shadow-md hover:from-green-700 hover:to-emerald-700 transition-all whitespace-nowrap${!processing && stats.confirmed > 0 && stats.pending === 0 ? ' btn-excel-active' : ''}`}>
-                ↓ 이 결과를 엑셀로 받기
-              </button>
+              {(() => {
+                const excelReady = !processing && stats.confirmed > 0 && stats.pending === 0;
+                return (
+                  <button onClick={excelReady ? dlAll : undefined}
+                    disabled={!excelReady}
+                    title={!excelReady ? '검증이 완료된 후 활성화됩니다' : ''}
+                    className={`mx-auto px-6 py-2.5 text-sm font-extrabold rounded-xl transition-all whitespace-nowrap
+                      ${excelReady
+                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white shadow-md hover:from-green-700 hover:to-emerald-700 btn-excel-active cursor-pointer'
+                        : 'bg-slate-200 text-slate-400 cursor-not-allowed shadow-none'}`}>
+                    ↓ 이 결과를 엑셀로 받기
+                  </button>
+                );
+              })()}
               <div className="w-4"/>
             </div>
             <BookTable rows={displayRows} onVerify={verifyOne} onOpenReview={setReviewId} />
