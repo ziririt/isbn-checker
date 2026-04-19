@@ -1,0 +1,1768 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>도서 리스트 ISBN 자동 확보/검증 AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Noto Sans KR', 'Segoe UI', sans-serif; }
+    @keyframes spin    { to { transform: rotate(360deg); } }
+    @keyframes fadein  { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
+    @keyframes pulse-green { 0%,100% { box-shadow: 0 0 0 0 rgba(34,197,94,0.7); transform:scale(1); } 50% { box-shadow: 0 0 0 10px rgba(34,197,94,0); transform:scale(1.04); } }
+    @keyframes verify-glow { 0%,100% { box-shadow: 0 0 0 0 rgba(5,150,105,0.55); } 50% { box-shadow: 0 0 20px 4px rgba(5,150,105,0.25); } }
+    .spin        { animation: spin   0.8s linear infinite; }
+    .fadein      { animation: fadein 0.15s ease-out; }
+    .btn-review  { animation: pulse-green 1.5s ease-in-out infinite; }
+    .btn-verify-active { animation: verify-glow 2s ease-in-out infinite; }
+    @keyframes excel-flash { 0%,100% { box-shadow: 0 0 0 0 rgba(22,163,74,0.8); transform:scale(1); } 50% { box-shadow: 0 0 0 14px rgba(22,163,74,0); transform:scale(1.03); } }
+    .btn-excel-active { animation: excel-flash 1.8s ease-in-out infinite; }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+<div id="root"></div>
+
+<script type="text/babel">
+// ============================================================
+// [§1] 환경 감지 & 상수
+// ============================================================
+const { useState, useCallback, useRef, useMemo } = React;
+
+/**
+ * file:// 프로토콜 감지
+ * file:// 로 열면 브라우저가 외부 JSONP script 호출을 차단함.
+ * → 타임아웃을 짧게 잡아 빠르게 실패하고 사용자에게 안내.
+ * → python3 -m http.server 8080 으로 서빙하면 SEARCH_MS 타임아웃 사용.
+ */
+const IS_FILE = window.location.protocol === 'file:';
+
+// JSONP 타임아웃 + CORS 프록시 폴백 타임아웃
+const LOOKUP_MS = IS_FILE ? 10000 : 15000;
+const SEARCH_MS = IS_FILE ? 10000 : 14000;
+const PROXY_MS  = 14000; // CORS 프록시 총 타임아웃 (2개 프록시 × 7초)
+
+/**
+ * 알라딘 OpenAPI 키
+ * ⚠️ 실서비스 전환 시 반드시 백엔드 프록시로 이동
+ *    (API 키 보안, CORS 처리, 도메인 허용 설정)
+ */
+const ALADIN_KEY     = 'ttbziririt1447041';  // 1차 키
+const ALADIN_KEY_SUB = 'ttbziririt1447043';  // 2차 키 (폴백)
+const ALADIN_SEARCH = 'https://www.aladin.co.kr/ttb/api/ItemSearch.aspx';
+const ALADIN_LOOKUP = 'https://www.aladin.co.kr/ttb/api/ItemLookUp.aspx';
+
+const DEFAULT_THRESHOLD = 0.80; // 검색 경로 자동확정 기준 (80%)
+
+const ST = {
+  PENDING:'pending', LOADING:'loading',
+  ACCURATE:'accurate', CONFIRMED:'confirmed',
+  REVIEW:'review', FAILED:'failed',
+};
+const ST_CFG = {
+  [ST.PENDING]:   { label:'대기중',   bg:'bg-gray-100',   text:'text-gray-500'   },
+  [ST.LOADING]:   { label:'처리중',   bg:'bg-blue-100',   text:'text-blue-600'   },
+  [ST.ACCURATE]:  { label:'정확',     bg:'bg-green-100',  text:'text-green-700'  },
+  [ST.CONFIRMED]: { label:'확정',     bg:'bg-teal-100',   text:'text-teal-700'   },
+  [ST.REVIEW]:    { label:'검토필요', bg:'bg-yellow-100', text:'text-yellow-800' },
+  [ST.FAILED]:    { label:'실패',     bg:'bg-red-100',    text:'text-red-600'    },
+};
+const SORT_PRI = {
+  [ST.LOADING]:1,[ST.REVIEW]:2,[ST.FAILED]:3,
+  [ST.PENDING]:4,[ST.ACCURATE]:5,[ST.CONFIRMED]:6,
+};
+
+/**
+ * 결과 유형 분류 — 메모 칼럼 색상 + 브리핑 통계에 사용
+ */
+const RT = {
+  ISBN_DIRECT:  'isbn_direct',   // 입력 ISBN 직접 확정 (조회 성공)
+  ISBN_CORRECT: 'isbn_correct',  // 입력 ISBN 보정 (ISBN 있었지만 검색 경로로 확정)
+  SEARCH_MATCH: 'search_match',  // ISBN 없이 검색 자동매칭
+  SERIES_MATCH: 'series_match',  // 시리즈 자동확정
+  MANUAL:       'manual',        // 수동 확정 (검토 모달에서 직접 선택)
+  REVIEW:       'review',        // 검토 필요
+  FAILED:       'failed',        // 실패
+  PENDING:      'pending',       // 미처리
+};
+const RT_CFG = {
+  [RT.ISBN_DIRECT]:  { label:'입력ISBN 직접확정',  color:'text-emerald-700', bg:'bg-emerald-50',  dot:'bg-emerald-500' },
+  [RT.ISBN_CORRECT]: { label:'입력ISBN 보정매칭',  color:'text-blue-700',    bg:'bg-blue-50',     dot:'bg-blue-500'    },
+  [RT.SEARCH_MATCH]: { label:'ISBN없이 검색매칭',  color:'text-teal-700',    bg:'bg-teal-50',     dot:'bg-teal-500'    },
+  [RT.SERIES_MATCH]: { label:'시리즈 자동확정',    color:'text-violet-700',  bg:'bg-violet-50',   dot:'bg-violet-500'  },
+  [RT.MANUAL]:       { label:'수동 확정',          color:'text-indigo-700',  bg:'bg-indigo-50',   dot:'bg-indigo-500'  },
+  [RT.REVIEW]:       { label:'검토 필요',          color:'text-amber-700',   bg:'bg-amber-50',    dot:'bg-amber-500'   },
+  [RT.FAILED]:       { label:'실패',               color:'text-red-600',     bg:'bg-red-50',      dot:'bg-red-500'     },
+  [RT.PENDING]:      { label:'미처리',             color:'text-slate-400',   bg:'bg-slate-50',    dot:'bg-slate-300'   },
+};
+function getResultType(row) {
+  if (row.status === ST.PENDING || row.status === ST.LOADING) return RT.PENDING;
+  if (row.status === ST.ACCURATE) return RT.ISBN_DIRECT;
+  if (row.status === ST.CONFIRMED) {
+    const method = row.selected?._method || '';
+    if (method === '수동검색') return RT.MANUAL;
+    if ((row.note||'').includes('시리즈')) return RT.SERIES_MATCH;
+    if (row.inputIsbn) return RT.ISBN_CORRECT; // ISBN 있었지만 검색으로 확정 = 보정
+    return RT.SEARCH_MATCH;
+  }
+  if (row.status === ST.REVIEW)  return RT.REVIEW;
+  if (row.status === ST.FAILED)  return RT.FAILED;
+  return RT.PENDING;
+}
+
+// ============================================================
+// [§2] JSONP 호출 & CORS 프록시 설정
+// ============================================================
+let _cbSeq = 0;
+
+/**
+ * CORS 프록시 라운드로빈 분산 배정
+ * 동시 3개 요청이 같은 프록시로 몰리면 rate limit에 걸림.
+ * → 호출마다 다른 프록시를 배정해 부하 분산.
+ */
+const PROXY_FNS = [
+  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  // thingproxy.freeboard.io: AbortController 무시로 무한 hanging 유발 — 제거
+];
+let _proxyIdx = 0; // 라운드로빈 카운터
+
+/**
+ * 알라딘 JSONP 호출
+ * 실서비스 전환 시: fetch('/api/aladin-proxy?...') 형태로 교체
+ *
+ * file:// 프로토콜에서 차단될 경우:
+ *   터미널 → python3 -m http.server 8080
+ *   브라우저 → http://localhost:8080/isbn-verifier.html
+ */
+function callAladin(endpoint, params, ms, key = ALADIN_KEY) {
+  return new Promise((resolve, reject) => {
+    const cbName = `__alCb_${Date.now()}_${_cbSeq++}`;
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      try { delete window[cbName]; } catch (_) {}
+      const el = document.getElementById(cbName);
+      if (el) el.parentNode.removeChild(el);
+    };
+    timer = setTimeout(() => { cleanup(); reject(new Error('TIMEOUT')); }, ms);
+    window[cbName] = (data) => { cleanup(); resolve(data); };
+    const qs = new URLSearchParams({
+      ttbkey: key, output: 'js', Version: '20131101',
+      ...params, callback: cbName,
+    }).toString();
+    const sc = document.createElement('script');
+    sc.id = cbName;
+    sc.src = `${endpoint}?${qs}`;
+    sc.onerror = () => { cleanup(); reject(new Error('NET_ERR')); };
+    document.head.appendChild(sc);
+  });
+}
+
+/**
+ * 1차 키 실패(NET_ERR · errorCode) 시 2차 키로 자동 재시도.
+ * TIMEOUT은 키 문제가 아니므로 즉시 throw.
+ */
+async function callAladinFallback(endpoint, params, ms) {
+  try {
+    const r = await callAladin(endpoint, params, ms, ALADIN_KEY);
+    // errorCode가 있으면 API 키 거부 → 2차 키 시도
+    if (r && r.errorCode) throw new Error('API_ERR');
+    return r;
+  } catch (e) {
+    if (e.message === 'TIMEOUT') throw e;  // 타임아웃은 키 교체로 해결 안 됨
+    // NET_ERR / API_ERR → 2차 키 재시도
+    return callAladin(endpoint, params, ms, ALADIN_KEY_SUB);
+  }
+}
+
+// ============================================================
+// [§3] ISBN 유틸
+// ============================================================
+function cleanIsbn(raw) { return String(raw ?? '').replace(/[^0-9Xx]/g, ''); }
+function isValidIsbn13(s) {
+  if (!s || s.length !== 13 || !/^\d{13}$/.test(s)) return false;
+  let sum = 0;
+  for (let i = 0; i < 12; i++) sum += parseInt(s[i]) * (i % 2 === 0 ? 1 : 3);
+  return (10 - (sum % 10)) % 10 === parseInt(s[12]);
+}
+
+// ============================================================
+// [§4] 유사도 & 점수 계산 (검색 경로 전용)
+// ============================================================
+function norm(t) {
+  if (!t) return '';
+  return String(t).toLowerCase()
+    .replace(/[^\w\s가-힣ㄱ-ㅎ]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+function tok(t) { return norm(t).split(' ').filter(w => w.length > 0); }
+
+function jaccard(a, b) {
+  const sa = new Set(tok(a)), sb = new Set(tok(b));
+  if (!sa.size && !sb.size) return 1;
+  if (!sa.size || !sb.size) return 0;
+  const inter = [...sa].filter(x => sb.has(x)).length;
+  return inter / (sa.size + sb.size - inter);
+}
+
+function prepTitle(t) {
+  if (!t) return '';
+  return String(t)
+    .replace(/(\d+)\s*권/g, '$1')   // "2권" → "2"  (알라딘 DB는 권 표기 생략)
+    .replace(/(개정판|신판|증보판|완전판|특별판|리뉴얼판|전면개정판|최신판|큰글자도서)\s*$/, '')
+    .replace(/\s*\([^)]*\)\s*$/, '')
+    .replace(/\s*\[[^\]]*\]\s*$/, '')
+    .trim();
+}
+
+/**
+ * 제목 유사도 — startsWith/includes/Jaccard 조합
+ * "삼체" vs "삼체 1:삼체문제" → 0.92 (prefix match)
+ * "총균쇠" vs "총, 균, 쇠" → 1.0 (공백제거 후 동일)
+ */
+function titleScore(a, b) {
+  if (!a || !b) return 0.5;
+  const na  = norm(prepTitle(a)), nb  = norm(prepTitle(b));
+  const na2 = norm(a),            nb2 = norm(b);
+  // 공백 완전 제거 버전 ("총균쇠" vs "총 균 쇠", 구두점 포함 케이스 대응)
+  const na3 = na.replace(/\s+/g,''),  nb3 = nb.replace(/\s+/g,'');
+  const na4 = na2.replace(/\s+/g,''), nb4 = nb2.replace(/\s+/g,'');
+
+  if (na === nb || na2 === nb2 || na3 === nb3 || na4 === nb4) return 1.0;
+  if (nb.startsWith(na)   || na.startsWith(nb))   return 0.92;
+  if (nb2.startsWith(na2) || na2.startsWith(nb2)) return 0.90;
+  if (nb3.startsWith(na3) || na3.startsWith(nb3)) return 0.90;
+  if (nb4.startsWith(na4) || na4.startsWith(nb4)) return 0.90;
+  if (nb.includes(na)   || na.includes(nb))   return 0.85;
+  if (nb2.includes(na2) || na2.includes(nb2)) return 0.82;
+  if (nb3.includes(na3) || na3.includes(nb3)) return 0.82;
+  if (nb4.includes(na4) || na4.includes(nb4)) return 0.82;
+  const inToks = tok(na2);
+  if (inToks.length > 0) {
+    const nbSet = new Set(tok(nb2));
+    const cov = inToks.filter(t => nbSet.has(t)).length / inToks.length;
+    if (cov >= 1.0) return 0.88;
+    if (cov >= 0.8) return 0.75;
+  }
+  return Math.max(jaccard(na, nb), jaccard(na2, nb2));
+}
+
+/**
+ * 시리즈 도서 판별
+ */
+function isSeriesBook(title) {
+  if (!title) return false;
+  return [
+    /[제]?\s*\d{1,3}\s*[권편부]/,
+    /[상하중]\s*(?:권|편)?(?:\s|$)/,
+    /전\s*(?:권|편)\s*(?:$|\s)/,/후\s*(?:권|편)\s*(?:$|\s)/,
+    /속\s*편/,/vol\.?\s*\d+/i,/book\s*\d+/i,/part\.?\s*\d+/i,
+    /\s+\d{1,2}$/,/[-—]\s*\d{1,2}$/,/\(\s*\d{1,2}\s*\)(?:\s|$)/,
+  ].some(p => p.test(String(title)));
+}
+
+function getSeriesId(title) {
+  if (!title) return null;
+  const t = String(title);
+  const koCh = t.match(/([상하중전후])\s*(?:권|편)?(?:\s|$)/);
+  if (koCh) return koCh[1];
+  const pats = [
+    /[제]?\s*(\d{1,3})\s*[권편부]/,/vol\.?\s*(\d+)/i,
+    /book\s*(\d+)/i,/part\.?\s*(\d+)/i,
+    /\(\s*(\d{1,2})\s*\)(?:\s|$)/,/\s+(\d{1,2})$/,/[-—]\s*(\d{1,2})$/,
+  ];
+  for (const p of pats) { const m = t.match(p); if (m) return m[1]; }
+  return null;
+}
+
+function seriesMismatch(inputTitle, candTitle) {
+  if (!isSeriesBook(inputTitle)) return false;
+  const inId = getSeriesId(inputTitle), candId = getSeriesId(candTitle);
+  if (inId === null || candId === null) return false;
+  return inId !== candId;
+}
+
+/**
+ * 검색 결과 종합 점수 (검색 경로에서만 사용)
+ */
+function scoreCandidate(input, cand) {
+  const tsc = titleScore(input.title, cand.title);
+
+  let authorSc = 0.5;
+  if (input.author && cand.author) {
+    const inToks = tok(input.author), candNorm = norm(cand.author);
+    authorSc = inToks.length
+      ? inToks.filter(t => candNorm.includes(t)).length / inToks.length : 0.5;
+  }
+
+  let pubSc = 0.5;
+  if (input.publisher && cand.publisher) {
+    const ni = norm(input.publisher), nc = norm(cand.publisher);
+    if (ni === nc) pubSc = 1.0;
+    else if (ni.includes(nc) || nc.includes(ni)) pubSc = 0.75;
+    else pubSc = jaccard(input.publisher, cand.publisher) * 0.5;
+  }
+
+  let priceSc = 0.5;
+  const ip = parseInt(String(input.price ?? '').replace(/[^0-9]/g, '')) || 0;
+  const cp = parseInt(cand.priceStandard) || 0;
+  if (ip > 0 && cp > 0) {
+    const d = Math.abs(ip - cp);
+    // 시간 경과에 따른 가격 변동 반영: 관대하게 처리
+    priceSc = d === 0 ? 1.0 : d <= 1000 ? 0.9 : d <= 3000 ? 0.7 : d <= 5000 ? 0.4 : 0.1;
+  }
+
+  // 가중치: 제목 60%, 저자 15%, 출판사 15%, 정가 10%
+  // (가격은 시간 경과로 변동이 크므로 비중 축소)
+  const raw = tsc * 0.60 + authorSc * 0.15 + pubSc * 0.15 + priceSc * 0.10;
+  return Math.max(0, Math.min(1, raw - (seriesMismatch(input.title, cand.title) ? 0.50 : 0)));
+}
+
+// ============================================================
+// [§5] 검증 로직
+// ============================================================
+
+async function runVerify(row, threshold) {
+  const isbn = cleanIsbn(row.inputIsbn);
+  if (isbn && isValidIsbn13(isbn)) return verifyByIsbn(row, isbn, threshold);
+  return verifyBySearch(row, threshold);
+}
+
+/**
+ * ISBN 직접 조회 경로
+ *
+ * 핵심 원칙: ISBN은 고유 식별자 — 조회 성공 = 즉시 확정
+ * 제목 유사도 비교는 하지 않는다.
+ * 유일한 예외: 입력에 시리즈 번호가 명시되어 있고, 조회 결과와 권수가 다른 경우
+ */
+async function verifyByIsbn(row, isbn, threshold) {
+  let data;
+  try {
+    data = await callAladinFallback(ALADIN_LOOKUP, { itemIdType: 'ISBN13', ItemId: isbn }, LOOKUP_MS);
+  } catch (_) {
+    // 조회 실패(타임아웃/네트워크) → 검색 폴백
+    return verifyBySearch(row, threshold);
+  }
+
+  if (!data?.item?.length) {
+    // ISBN은 유효하지만 알라딘에 없음 → 검색으로 보완
+    return verifyBySearch(row, threshold);
+  }
+
+  const book = data.item[0];
+
+  // 유일한 거부 조건: 시리즈 번호 불일치
+  if (seriesMismatch(row.title, book.title)) {
+    return {
+      status: ST.REVIEW,
+      candidates: [{ ...book, _score: titleScore(row.title, book.title) }],
+      note: `⚠ 시리즈 번호 불일치 — ISBN이 가리키는 권수를 직접 확인해주세요.`,
+    };
+  }
+
+  // ISBN 확정: 조회 성공 → 제목 비교 없이 바로 ACCURATE
+  return {
+    status: ST.ACCURATE,
+    isbnVerified: true,
+    selected: { ...book, _method: 'ISBN확정' },
+    candidates: [{ ...book, _score: titleScore(row.title, book.title) }],
+    note: `ISBN 직접 조회 확정`,
+  };
+}
+
+/**
+ * 키워드 검색 경로 (ISBN 없거나 유효하지 않은 경우)
+ *
+ * 공통: 제목 검색 → 결과 없으면 제목+저자 키워드 검색 (2단계)
+ * IS_FILE: JSONP 스킵, CORS 프록시 직행
+ * HTTP: JSONP 우선, 실패 시 프록시 폴백
+ */
+async function verifyBySearch(row, threshold) {
+  const title  = row.title?.trim();
+  const author = row.author?.trim();
+  if (!title) return { status: ST.FAILED, note: '제목 정보가 없어 검색할 수 없습니다.' };
+
+  let data = null;
+
+  // 1단계: 제목 검색
+  data = await _trySearch(title, 'Title', SEARCH_MS);
+
+  // 2단계: 결과 없으면 제목+저자 키워드 검색
+  if (!data?.item?.length && author) {
+    data = await _trySearch([title, author].filter(Boolean).join(' '), 'Keyword', SEARCH_MS);
+  }
+
+  if (!data) {
+    return {
+      status: ST.FAILED,
+      note: IS_FILE
+        ? `"${title}" — JSONP 및 CORS 프록시 모두 실패. python3 -m http.server 8080 권장`
+        : `"${title}" API 호출 실패`,
+    };
+  }
+
+  if (!data.item?.length) {
+    return { status: ST.FAILED, note: `"${title}" 검색 결과 없음.` };
+  }
+
+  return _rankAndDecide(row, data.item, threshold);
+}
+
+/** 검색 API 호출
+ *
+ * IS_FILE 환경: JSONP + CORS 프록시를 동시에 실행 → 먼저 성공한 것 사용 (레이스)
+ *   - ISBN LookUp이 file://에서 JSONP로 작동하듯 Search도 응답할 수 있음
+ *   - 프록시가 빠르면 프록시 결과, JSONP가 빠르면 JSONP 결과 사용
+ *   - 둘 다 실패해야 FAILED
+ * HTTP 환경: JSONP 우선, 실패 시 프록시 폴백.
+ */
+async function _trySearch(query, queryType, ms) {
+  const searchParams = {
+    Query: query, QueryType: queryType,
+    SearchTarget: 'Book', MaxResults: 10, start: 1, Sort: 'Accuracy',
+  };
+
+  if (IS_FILE) {
+    // 레이스: 1차 키 JSONP + 프록시 동시 실행, 먼저 오는 것 사용
+    return raceNonNull([
+      callAladinFallback(ALADIN_SEARCH, searchParams, 8000).catch(() => null),
+      _searchViaProxy(query, queryType, PROXY_MS),
+    ]);
+  }
+
+  // HTTP: 1차 키 JSONP → 실패 시 2차 키 JSONP → 모두 실패 시 프록시(1차→2차)
+  try {
+    const r = await callAladinFallback(ALADIN_SEARCH, searchParams, ms);
+    if (r && !r.errorCode) return r;
+  } catch (_) {}
+  // 프록시도 1차 키 먼저, 실패 시 2차 키
+  const p1 = await _searchViaProxy(query, queryType, PROXY_MS, ALADIN_KEY).catch(() => null);
+  if (p1 && !p1.errorCode) return p1;
+  return _searchViaProxy(query, queryType, PROXY_MS, ALADIN_KEY_SUB);
+}
+
+/**
+ * CORS 프록시를 통한 알라딘 검색
+ *
+ * 라운드로빈(_proxyIdx)으로 시작 프록시를 분산 배정.
+ * 동시 2-3개 요청이 서로 다른 프록시에 배분되어 rate limit 회피.
+ * HTML 오류 응답(프록시 차단 메시지) 즉시 감지 후 다음 프록시로.
+ */
+async function _searchViaProxy(query, queryType, ms, key = ALADIN_KEY) {
+  const qs = new URLSearchParams({
+    ttbkey: key, output: 'js', Version: '20131101',
+    Query: query, QueryType: queryType,
+    SearchTarget: 'Book', MaxResults: 10, start: 1, Sort: 'Accuracy',
+  }).toString();
+  const aladinUrl = `${ALADIN_SEARCH}?${qs}`;
+
+  // 라운드로빈 시작 인덱스 — 매 호출마다 다른 프록시부터 시작
+  const startIdx = _proxyIdx++ % PROXY_FNS.length;
+  const ordered = [
+    ...PROXY_FNS.slice(startIdx),
+    ...PROXY_FNS.slice(0, startIdx),
+  ];
+
+  // 총 허용 시간을 프록시 수로 나누어 균등 배분
+  const perMs = Math.max(6000, Math.ceil(ms / ordered.length));
+
+  for (const proxyFn of ordered) {
+    try {
+      const proxyUrl = proxyFn(aladinUrl);
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), perMs);
+      let resp;
+      try { resp = await fetch(proxyUrl, { signal: ctrl.signal }); }
+      finally { clearTimeout(tid); }
+      if (!resp || !resp.ok) continue;
+
+      const text = await resp.text();
+      // HTML 오류 페이지(rate limit, 403 등) 즉시 스킵
+      if (!text || text.trim().startsWith('<')) continue;
+
+      // 파싱: 일반 JSON → JSONP 함수 래퍼 벗기기 (콜백명 무관)
+      let data = null;
+      try { data = JSON.parse(text); } catch (_) {}
+      if (!data) {
+        // anyCallbackName({...}) 또는 anyCallbackName({...});
+        const stripped = text.replace(/^\s*[\w$]+\s*\(/, '').replace(/\)\s*;?\s*$/, '').trim();
+        try { data = JSON.parse(stripped); } catch (_) {}
+      }
+      if (data) return data;
+    } catch (_) { continue; }
+  }
+  return null;
+}
+
+/** 검색 결과 점수화 → 자동확정 or 검토필요 판정 */
+function _rankAndDecide(row, items, threshold) {
+  const isSeries = isSeriesBook(row.title);
+  const inputId  = getSeriesId(row.title);
+
+  const scored = items
+    .map(item => ({ ...item, _score: scoreCandidate(row, item) }))
+    .sort((a, b) => b._score - a._score);
+
+  const top3 = scored.slice(0, 3);
+  const best = top3[0];
+
+  if (isSeries) {
+    const matched = scored.filter(c => {
+      const cId = getSeriesId(c.title);
+      return cId === null || inputId === null || cId === inputId;
+    });
+    if (matched.length && matched[0]._score >= threshold) {
+      return { status:ST.CONFIRMED, selected:{...matched[0],_method:'자동매칭'}, candidates:top3,
+               note:`시리즈 매칭 자동확정 (${pct(matched[0]._score)}%)` };
+    }
+    return { status:ST.REVIEW, candidates:top3,
+             note:`시리즈 도서 — 권수/상하 직접 확인 필요 (최고 ${pct(best._score)}%)` };
+  }
+
+  if (best._score >= threshold) {
+    return { status:ST.CONFIRMED, selected:{...best,_method:'자동매칭'}, candidates:top3,
+             note:`자동매칭 확정 (${pct(best._score)}%)` };
+  }
+  if (best._score >= 0.45) {
+    return { status:ST.REVIEW, candidates:top3,
+             note:`후보 ${top3.length}건 (최고 ${pct(best._score)}%). 직접 선택해주세요.` };
+  }
+  return { status:ST.FAILED,
+           note:`유사 후보 없음 (최고 ${pct(best._score)}%). 직접 검색 권장.` };
+}
+
+// ============================================================
+// [§5-B] 유틸: 여러 Promise 중 최초 truthy 결과 반환
+// ============================================================
+
+/**
+ * raceNonNull: 주어진 모든 Promise를 동시에 실행하고
+ * 가장 먼저 truthy 값을 반환한 것을 resolve.
+ * 전부 falsy/reject이면 null resolve.
+ */
+function raceNonNull(promises) {
+  return new Promise((resolve) => {
+    let pending = promises.length;
+    if (!pending) { resolve(null); return; }
+    promises.forEach(p =>
+      Promise.resolve(p)
+        .then(r => { if (r) resolve(r); else if (--pending === 0) resolve(null); })
+        .catch(() => { if (--pending === 0) resolve(null); })
+    );
+  });
+}
+
+// ============================================================
+// [§6] 엑셀 파싱
+// ============================================================
+/**
+ * 칼럼명 인식 사전
+ * 도서관·업체·시스템마다 칼럼명이 제각각이므로 최대한 넓게 커버.
+ * 슬래시·파이프·쉼표·공백으로 합쳐진 복합 칼럼명(예: "저자/아티스트")도 처리.
+ */
+const COL_ALIASES = {
+  title: [
+    // 한국어
+    '제목','도서명','서명','책제목','도서명칭','책명','상품명','품명',
+    '도서제목','서지명','타이틀','도서','책이름','도서 제목','서지 제목',
+    '도서명(제목)','도서명/제목','제목(도서명)',
+    // 영어
+    'title','book title','booktitle','book name','bookname','name',
+  ],
+  author: [
+    // 한국어
+    '저자','작가','저자명','글쓴이','지은이','엮은이','편저자','편저',
+    '그린이','옮긴이','역자','역자명','아티스트','저자/아티스트',
+    '저자(작가)','저자 및 아티스트','글·그림','글/그림','글쓴이/그린이',
+    '지은이/옮긴이','저자(번역가)',
+    // 영어
+    'author','authors','writer','artist','creator',
+  ],
+  publisher: [
+    // 한국어
+    '출판사','발행사','출판자','발행처','출판처','제작사','발행인',
+    '출판사명','퍼블리셔','출판(사)','출판사/제작사','발행사(출판사)',
+    '출판사명(발행처)','출판(발행)',
+    // 영어
+    'publisher','publishers','pub','press',
+  ],
+  price: [
+    // 한국어
+    '정가','가격','단가','판매가','판매가격','소비자가','소비자가격',
+    '권장소비자가격','표준정가','도서정가','소비자판매가',
+    '정가(원)','가격(원)','판매가(원)','정 가',
+    // 영어
+    'price','list price','retail price','msrp',
+  ],
+  isbn: [
+    // 숫자 형태
+    'isbn','isbn13','isbn-13','isbn_13','isbn 13',
+    'isbn10','isbn-10','isbn_10','isbn 10',
+    // 혼합/한국어
+    'isbn번호','isbn 번호','바코드','isbn코드','isbn(13자리)',
+    'isbn13(바코드)','도서isbn','isbn/바코드','국제표준도서번호',
+    // 대문자 변형 (toLowerCase 후 비교되므로 소문자로 저장해도 됨)
+    'ISBN','ISBN13','ISBN-13','ISBN10','ISBN-10',
+  ],
+};
+
+/**
+ * 헤더 문자열 → 필드 키 매핑
+ *
+ * 3단계 전략:
+ * 1. 전체 헤더 정규화 후 사전과 완전 일치
+ * 2. 슬래시·파이프·쉼표 등으로 쪼갠 각 부분과 사전 완전 일치
+ *    → "저자/아티스트" 의 "저자" 부분이 매칭됨
+ * 3. 전체·부분 중 하나라도 사전 키워드를 포함(contains)하는 경우
+ *    (키워드 길이 ≥ 3자 이상만 적용 — 오탐 방지)
+ */
+function mapHeader(h) {
+  if (h === null || h === undefined || String(h).trim() === '') return null;
+  const normalize = s => String(s).toLowerCase().replace(/\s+/g, '').trim();
+  const fullNorm = normalize(h);
+
+  // 슬래시·파이프·쉼표·중점·공백 기준으로 쪼갠 부분 목록
+  const parts = String(h).split(/[\/\|,·&\s]+/)
+    .map(p => normalize(p))
+    .filter(p => p.length >= 1);
+
+  const candidates = [...new Set([fullNorm, ...parts])];
+
+  for (const [key, aliases] of Object.entries(COL_ALIASES)) {
+    const normAliases = aliases.map(a => normalize(a));
+
+    // 1·2단계: 완전 일치 (전체 or 쪼갠 부분)
+    for (const c of candidates) {
+      if (normAliases.includes(c)) return key;
+    }
+
+    // 3단계: contains 일치 (오탐 방지용 최소 길이 3자)
+    for (const c of candidates) {
+      for (const a of normAliases) {
+        if (a.length >= 3 && c.includes(a)) return key;
+        if (a.length >= 3 && a.includes(c) && c.length >= 3) return key;
+      }
+    }
+  }
+  return null;
+}
+/**
+ * AI 칼럼 추론 — 헤더가 없거나 인식 실패 시 데이터 패턴으로 칼럼 유추
+ */
+function guessColumns(json) {
+  const dataRows = json.slice(1).filter(r => r.some(c => String(c).trim()));
+  if (!dataRows.length) return {};
+  const colCount = Math.max(...json.map(r => r.length));
+  const ci = {};
+
+  for (let col = 0; col < colCount; col++) {
+    const vals = dataRows.map(r => String(r[col]??'').replace(/[\s",]/g,'')).filter(v=>v);
+    if (!vals.length) continue;
+
+    // ISBN: 13자리 숫자 (979/978 시작)
+    const isbnHits = vals.filter(v => /^97[89]\d{10}$/.test(v)).length;
+    if (isbnHits > vals.length * 0.4 && ci.isbn===undefined) { ci.isbn = col; continue; }
+
+    // 가격: 1000~200000 범위 숫자
+    const priceHits = vals.filter(v => { const n=parseInt(v.replace(/[^0-9]/g,'')); return n>=1000&&n<=200000; }).length;
+    if (priceHits > vals.length * 0.6 && ci.price===undefined) { ci.price = col; continue; }
+
+    // 저자: '지음','저','글','역' 패턴 포함
+    const authorHits = vals.filter(v => /지음|저자|지은이|옮긴이|글쓴|편저|지어/.test(v)).length;
+    if (authorHits > vals.length * 0.25 && ci.author===undefined) { ci.author = col; continue; }
+  }
+
+  // 제목: 아직 배정 안 된 칼럼 중 평균 길이가 가장 긴 것
+  const assigned = new Set(Object.values(ci));
+  let best = -1, bestLen = 0;
+  for (let col = 0; col < colCount; col++) {
+    if (assigned.has(col)) continue;
+    const vals = dataRows.map(r => String(r[col]??'').trim()).filter(v=>v.length>1);
+    const avg = vals.reduce((s,v)=>s+v.length,0) / (vals.length||1);
+    if (avg > bestLen) { bestLen = avg; best = col; }
+  }
+  if (best >= 0 && ci.title===undefined) ci.title = best;
+
+  // 출판사: 배정 안 된 짧은 한국어 텍스트 칼럼
+  const assigned2 = new Set(Object.values(ci));
+  for (let col = 0; col < colCount; col++) {
+    if (assigned2.has(col)) continue;
+    const vals = dataRows.map(r => String(r[col]??'').trim()).filter(v=>v.length>0);
+    const avgLen = vals.reduce((s,v)=>s+v.length,0)/(vals.length||1);
+    if (avgLen >= 2 && avgLen <= 20 && ci.publisher===undefined) { ci.publisher = col; break; }
+  }
+
+  return ci;
+}
+
+function parseSheet(ws) {
+  const json = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' });
+  if (json.length < 1) return { rows:[], err:'EMPTY' };
+
+  // 헤더 매핑 시도
+  const headers = json[0] || [];
+  const ci = {};
+  headers.forEach((h,i) => { const k = mapHeader(h); if (k && ci[k]===undefined) ci[k]=i; });
+
+  const hasUseful = ci.title!==undefined || ci.isbn!==undefined;
+
+  // 헤더 미인식 → AI 추론 시도
+  if (!hasUseful) {
+    const guessed = guessColumns(json);
+    Object.assign(ci, guessed);
+  }
+
+  const foundHeaders = headers.filter(h=>String(h).trim()).map(h=>`"${String(h).trim()}"`).join(', ');
+
+  if (ci.title===undefined && ci.isbn===undefined) {
+    return { rows:[], err:'NO_COLUMNS', foundHeaders };
+  }
+
+  if (json.length < 2) return { rows:[], err:'NO_DATA' };
+
+  const rows = json.slice(1)
+    .filter(r => r.some(c => String(c).trim() !== ''))
+    .map((r, idx) => ({
+      id:idx+1,
+      title:     String(ci.title     !==undefined ? r[ci.title]     ??'' : '').trim(),
+      author:    String(ci.author    !==undefined ? r[ci.author]    ??'' : '').trim(),
+      publisher: String(ci.publisher !==undefined ? r[ci.publisher] ??'' : '').trim(),
+      price:     String(ci.price     !==undefined ? r[ci.price]     ??'' : '').trim(),
+      inputIsbn: cleanIsbn(String(ci.isbn !==undefined ? r[ci.isbn] ??'' : '')),
+      isbnVerified:false, candidates:[], deletedCandidateIndexes:[],
+      selected:null, loading:false, status:ST.PENDING, note:'', processingMs:null, reVerifyCount:0,
+    }));
+
+  return { rows, guessed: !hasUseful };
+}
+
+/** 텍스트(TSV/CSV/TXT) → SheetJS AoA 변환 후 parseSheet */
+function parseTextContent(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (!lines.length) return { rows:[], err:'EMPTY' };
+  // 구분자 자동 감지: 탭 > 콤마 > 세미콜론 > 파이프
+  const counts = { '\t':0, ',':0, ';':0, '|':0 };
+  lines.slice(0, Math.min(5, lines.length)).forEach(l =>
+    Object.keys(counts).forEach(d => { counts[d] += (l.match(new RegExp('\\'+d,'g'))||[]).length; })
+  );
+  const delim = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0];
+  const aoa = lines.map(l => l.split(delim).map(c => c.replace(/^"|"$/g,'').trim()));
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  return parseSheet(ws);
+}
+
+/** HTML 파일의 첫 번째 테이블 파싱 */
+function parseHtmlContent(html) {
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const table = doc.querySelector('table');
+    if (!table) return { rows:[], err:'HTML_NO_TABLE' };
+    const aoa = [];
+    table.querySelectorAll('tr').forEach(tr => {
+      const cells = [];
+      tr.querySelectorAll('td,th').forEach(td => cells.push(td.innerText?.trim() ?? td.textContent?.trim() ?? ''));
+      if (cells.some(c=>c)) aoa.push(cells);
+    });
+    if (!aoa.length) return { rows:[], err:'EMPTY' };
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    return parseSheet(ws);
+  } catch(e) {
+    return { rows:[], err:'HTML_PARSE_ERR' };
+  }
+}
+
+/** XLS/XLSX 바이너리 시그니처 확인 */
+function isRealBinaryOffice(data) {
+  if (data.length < 4) return false;
+  const d = data;
+  const isXls  = d[0]===0xD0 && d[1]===0xCF && d[2]===0x11 && d[3]===0xE0;
+  const isXlsx = d[0]===0x50 && d[1]===0x4B && d[2]===0x03 && d[3]===0x04;
+  return isXls || isXlsx;
+}
+
+// ============================================================
+// [§7] 엑셀 다운로드
+// ============================================================
+function selMethod(row) {
+  if (row.status===ST.ACCURATE)  return 'ISBN확정';
+  if (row.status===ST.CONFIRMED) return row.selected?._method||'자동매칭';
+  return '미확정';
+}
+function toExcel(rows, filename) {
+  // 확정 완료된 행만 포함
+  const confirmed = rows.filter(r => r.status === ST.ACCURATE || r.status === ST.CONFIRMED);
+  const data = confirmed.map(row => {
+    const s = row.selected;
+    return {
+      'ISBN':    s?.isbn13     || row.inputIsbn|| '',
+      '제목':    s?.title      || row.title    || '',
+      '저자':    s?.author     || row.author   || '',
+      '출판사':  s?.publisher  || row.publisher|| '',
+      '출간일':  s?.pubDate    || '',
+    };
+  });
+  const ws = XLSX.utils.json_to_sheet(data);
+  ws['!cols'] = [16, 36, 20, 16, 12].map(w => ({wch: w}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '검증결과');
+  XLSX.writeFile(wb, filename);
+}
+
+function makeFilename(rows) {
+  // 리스트 맨 위 도서명 (첫 번째 행 기준)
+  const firstTitle = (rows[0]?.title || '도서리스트')
+    .replace(/[\\/:*?"<>|]/g, '')   // 파일명 불가 문자 제거
+    .slice(0, 30).trim();
+  // 확정 건수
+  const cnt = rows.filter(r => r.status === ST.ACCURATE || r.status === ST.CONFIRMED).length;
+  // 날짜·시각
+  const now = new Date();
+  const ymd = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+  const hm  = `${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+  return `${firstTitle}_포함${cnt}건_${ymd}_${hm}.xlsx`;
+}
+
+// ============================================================
+// [§8] 샘플 데이터
+// ============================================================
+const SAMPLE = [
+  { id:1, title:'삼체',                   author:'류츠신',            publisher:'자음과모음', price:'16800', inputIsbn:'9791192247939' },
+  { id:2, title:'해리포터와 마법사의 돌', author:'J.K. 롤링',        publisher:'문학수첩',   price:'15000', inputIsbn:'' },
+  { id:3, title:'코스모스',               author:'칼 세이건',         publisher:'사이언스북스',price:'25000', inputIsbn:'9788983711892' },
+  { id:4, title:'총균쇠',                 author:'재레드 다이아몬드', publisher:'문학사상',   price:'28000', inputIsbn:'' },
+  { id:5, title:'아몬드',                 author:'손원평',            publisher:'창비',       price:'13000', inputIsbn:'9788836400' },
+  { id:6, title:'채식주의자',             author:'한강',              publisher:'창비',       price:'12000', inputIsbn:'' },
+  { id:7, title:'82년생 김지영',          author:'조남주',            publisher:'민음사',     price:'13800', inputIsbn:'9788937438554' },
+  { id:8, title:'해리포터와 비밀의 방',   author:'J.K. 롤링',        publisher:'문학수첩',   price:'15000', inputIsbn:'' },
+].map(r => ({...r, isbnVerified:false, candidates:[], deletedCandidateIndexes:[], selected:null, loading:false, status:ST.PENDING, note:'', processingMs:null}));
+
+// ============================================================
+// [§9] 유틸
+// ============================================================
+function pct(score) { return Math.round((score??0)*100); }
+function fmtPrice(p) {
+  const n = parseInt(String(p??'').replace(/[^0-9]/g,''));
+  return isNaN(n) ? '-' : `${n.toLocaleString()}원`;
+}
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+function isApiErr(note) { return /TIMEOUT|NET_ERR|API 차단|API 호출 실패|프록시 모두 실패/.test(note||''); }
+
+// ============================================================
+// [§9-B] 자동확정 기준 설명 툴팁
+// ============================================================
+function ThresholdInfo({ threshold, onChange }) {
+  const pctVal = Math.round(threshold * 100);
+  const level =
+    threshold >= 0.90 ? { label:'엄격', color:'text-red-600',    bg:'bg-red-50',    bar:'bg-red-400'    } :
+    threshold >= 0.75 ? { label:'적정', color:'text-emerald-600', bg:'bg-emerald-50', bar:'bg-emerald-500' } :
+                        { label:'관대', color:'text-orange-500',  bg:'bg-orange-50', bar:'bg-orange-400'  };
+
+  // 슬라이더 위치 퍼센트 (0.5~1.0 범위를 0~100%로 매핑)
+  const sliderPct = ((threshold - 0.5) / 0.5) * 100;
+
+  return (
+    <div className="flex flex-col gap-1 min-w-[260px]">
+      {/* 라벨 + 슬라이더 + 값 */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-semibold text-slate-700 whitespace-nowrap">자동확정 기준</span>
+        <input type="range" min={0.5} max={1.0} step={0.05} value={threshold}
+          onChange={e=>onChange(parseFloat(e.target.value))}
+          className="w-28 accent-blue-600 cursor-pointer" />
+        <span className={`font-mono font-bold text-sm w-10 text-right ${level.color}`}>{pctVal}%</span>
+        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${level.bg} ${level.color}`}>{level.label}</span>
+      </div>
+
+      {/* 항상 보이는 설명 */}
+      <div className="text-[11px] text-slate-600 leading-relaxed pl-0.5">
+        {threshold >= 0.90 && (
+          <span>제목·저자가 <strong className="text-red-600">거의 완벽히 일치</strong>해야만 자동 확정. 조금이라도 다르면 검토 필요로 넘어옵니다. 검토 건수 많아짐.</span>
+        )}
+        {threshold >= 0.75 && threshold < 0.90 && (
+          <span>제목·저자가 <strong className="text-emerald-700">충분히 비슷</strong>하면 자동 확정. 정확도와 편의성의 <strong className="text-emerald-700">균형잡힌 권장값</strong>.</span>
+        )}
+        {threshold < 0.75 && (
+          <span>조금 달라도 자동 확정. 처리 속도는 빠르지만 <strong className="text-orange-600">엉뚱한 책이 확정될 수 있습니다</strong>. 주의 필요.</span>
+        )}
+        <span className="ml-1 text-slate-400">※ ISBN 있는 도서는 이 기준 무관하게 항상 ISBN 직접 확정.</span>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// [§10] StatusBadge
+// ============================================================
+function StatusBadge({ status }) {
+  const { label, bg, text } = ST_CFG[status] ?? ST_CFG[ST.PENDING];
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${bg} ${text}`}>
+      {status===ST.LOADING && (
+        <svg className="spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" opacity="0.25"/>
+          <path fill="currentColor" opacity="0.75" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+        </svg>
+      )}
+      {label}
+    </span>
+  );
+}
+
+/**
+ * 테이블 전용 상태 뱃지 — RT(결과유형) 기반의 직관적 용어 사용
+ */
+function RowStatusBadge({ row }) {
+  // 처리 중 / 대기 중은 기존 StatusBadge 그대로
+  if (row.status === ST.LOADING) return <StatusBadge status={ST.LOADING} />;
+  if (row.status === ST.PENDING) return <StatusBadge status={ST.PENDING} />;
+
+  const rt = getResultType(row);
+  const CFG = {
+    [RT.ISBN_DIRECT]:  { label:'입력ISBN 정상',     cls:'bg-emerald-100 text-emerald-800' },
+    [RT.ISBN_CORRECT]: { label:'ISBN 정정완료',     cls:'bg-red-100 text-red-700 font-extrabold' },
+    [RT.SEARCH_MATCH]: { label:'ISBN 매칭완료',     cls:'bg-teal-100 text-teal-800 font-extrabold' },
+    [RT.SERIES_MATCH]: { label:'시리즈 확정완료',   cls:'bg-violet-100 text-violet-700 font-bold' },
+    [RT.MANUAL]:       { label:'수동 확정완료',     cls:'bg-indigo-100 text-indigo-700 font-bold' },
+    [RT.REVIEW]:       { label:'검토 필요',         cls:'bg-yellow-100 text-yellow-800 font-bold' },
+    [RT.FAILED]:       { label:'확정 실패',         cls:'bg-red-100 text-red-700 font-bold' },
+  };
+  const c = CFG[rt] ?? { label:'대기 중', cls:'bg-slate-100 text-slate-700' };
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs whitespace-nowrap ${c.cls}`}>
+      {c.label}
+    </span>
+  );
+}
+
+function ScoreBadge({ score }) {
+  const p = pct(score);
+  const cl = p>=80?'bg-green-100 text-green-700':p>=60?'bg-yellow-100 text-yellow-700':'bg-red-100 text-red-600';
+  return <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${cl}`}>{p}점</span>;
+}
+
+function SummaryCard({ label, value, color }) {
+  const colors = {
+    gray:'bg-white border-slate-200 text-slate-800',
+    green:'bg-green-50 border-green-200 text-green-800',
+    yellow:'bg-yellow-50 border-yellow-200 text-yellow-800',
+    red:'bg-red-50 border-red-200 text-red-800',
+    blue:'bg-blue-50 border-blue-200 text-blue-800',
+  };
+  return (
+    <div className={`rounded-xl border px-4 py-3 ${colors[color]}`}>
+      <div className="text-2xl font-bold">{value}</div>
+      <div className="text-xs mt-0.5 opacity-60 font-medium">{label}</div>
+    </div>
+  );
+}
+
+// ============================================================
+// [§11] CandidateCard
+// ============================================================
+function CandidateCard({ candidate, rank, onConfirm, onDelete }) {
+  const scoreP = candidate._score!=null ? pct(candidate._score) : null;
+  const scoreCfg = scoreP==null ? null
+    : scoreP>=80 ? { label:`AI확률 ${scoreP}%`, cls:'bg-green-100 text-green-800 border-green-300' }
+    : scoreP>=60 ? { label:`AI확률 ${scoreP}%`, cls:'bg-yellow-100 text-yellow-800 border-yellow-300' }
+    :              { label:`AI확률 ${scoreP}%`, cls:'bg-red-50 text-red-700 border-red-200' };
+  return (
+    <div className="border border-slate-300 rounded-lg p-3.5 bg-white hover:border-blue-400 transition-colors fadein">
+      <div className="flex justify-between items-start gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap mb-1.5">
+            {rank!=null && <span className="text-xs bg-slate-700 text-white px-2 py-0.5 rounded-full font-bold shrink-0">{rank}순위</span>}
+            {isSeriesBook(candidate.title) && (
+              <span className="text-xs bg-purple-200 text-purple-800 px-1.5 py-0.5 rounded font-semibold">시리즈</span>
+            )}
+          </div>
+          <div className="font-bold text-slate-900 text-sm leading-snug mb-1.5">{candidate.title}</div>
+          <div className="text-sm text-slate-700 space-y-0.5">
+            <div><span className="font-semibold text-slate-900">저자</span> {candidate.author||'-'} · <span className="font-semibold text-slate-900">출판사</span> {candidate.publisher||'-'}</div>
+            <div><span className="font-semibold text-slate-900">출간</span> {candidate.pubDate||'-'} · <span className="font-semibold text-slate-900">정가</span> {fmtPrice(candidate.priceStandard)} · <span className="font-semibold text-slate-900">ISBN</span> {candidate.isbn13||'-'}</div>
+          </div>
+        </div>
+        <div className="flex flex-col gap-1.5 shrink-0 items-stretch">
+          {scoreCfg && (
+            <span className={`text-xs font-bold px-2 py-0.5 rounded border text-center ${scoreCfg.cls}`}>{scoreCfg.label}</span>
+          )}
+          <button onClick={onConfirm}
+            className="px-4 py-2 bg-blue-600 text-white rounded-md text-sm font-bold hover:bg-blue-700 transition-colors whitespace-nowrap">
+            바로 넣기
+          </button>
+          {onDelete && (
+            <button onClick={onDelete}
+              className="px-4 py-2 border border-slate-400 text-slate-700 rounded-md text-sm font-medium hover:bg-slate-100 transition-colors whitespace-nowrap">
+              후보 삭제
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// [§12] ReviewModal
+// ============================================================
+function ReviewModal({ row, onClose, onConfirm, onDeleteCandidate, onUpdateNote }) {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [searchErr, setSearchErr] = useState('');
+  const [note, setNote] = useState(row.note||'');
+
+  const visible = row.candidates.filter((_,i) => !row.deletedCandidateIndexes.includes(i));
+
+  const doSearch = async (overrideQuery) => {
+    const q = (overrideQuery ?? query).trim();
+    if (!q) return;
+    if (overrideQuery !== undefined) setQuery(overrideQuery);
+    setSearching(true); setSearchErr(''); setResults([]);
+    try {
+      // JSONP + CORS 프록시 폴백 모두 사용 (직접 검색도 동일 경로)
+      const data = await _trySearch(q, 'Keyword', SEARCH_MS);
+      if (data?.item?.length) {
+        setResults(data.item.map(item => ({...item, _score:scoreCandidate(row,item)})));
+      } else {
+        setSearchErr('검색 결과 없습니다. 다른 검색어를 시도해보세요.');
+      }
+    } catch (_) {
+      setSearchErr('검색에 실패했습니다. 잠시 후 다시 시도해보세요.');
+    } finally { setSearching(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 fadein"
+         onClick={e => { if(e.target===e.currentTarget){onUpdateNote(note);onClose();} }}>
+      <div className="bg-white rounded-2xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl">
+        {/* 헤더 */}
+        <div className="flex items-start justify-between px-5 py-4 border-b border-slate-200 bg-slate-50 rounded-t-2xl">
+          <div className="flex-1 min-w-0 pr-3">
+            <div className="flex items-center gap-2 mb-1">
+              <h2 className="text-base font-bold text-slate-900">후보 검토</h2>
+              {isSeriesBook(row.title) && (
+                <span className="text-xs bg-purple-200 text-purple-900 px-2 py-0.5 rounded-full font-semibold">시리즈</span>
+              )}
+            </div>
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-0.5">입력 제목</div>
+            <p className="text-base font-bold text-slate-900 leading-snug">
+              {row.title||'(제목 없음)'}
+              {row.author && <span className="text-sm font-normal text-slate-700 ml-2">· {row.author}</span>}
+            </p>
+          </div>
+          <button onClick={()=>{onUpdateNote(note);onClose();}}
+                  className="text-slate-500 hover:text-slate-900 text-2xl font-bold px-1.5 hover:bg-slate-200 rounded transition-colors">×</button>
+        </div>
+        {/* 바디 */}
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-5">
+          {/* 기본 정보 */}
+          <div className="bg-slate-100 border border-slate-200 rounded-lg px-4 py-3 text-sm text-slate-800 grid grid-cols-2 gap-2">
+            <span><span className="font-bold text-slate-900">출판사</span> {row.publisher||'-'}</span>
+            <span><span className="font-bold text-slate-900">정가</span> {fmtPrice(row.price)}</span>
+            <span><span className="font-bold text-slate-900">입력 ISBN</span> {row.inputIsbn || <span className="text-purple-700 font-bold">ISBN없음</span>}</span>
+            <span><span className="font-bold text-slate-900">상태</span> <RowStatusBadge row={row} /></span>
+          </div>
+
+          {/* ① 직접 검색 — 최우선 노출 */}
+          <div className="bg-blue-50 border-2 border-blue-300 rounded-lg px-4 py-4">
+            <h3 className="text-sm font-bold text-slate-900 mb-2">직접 검색</h3>
+            {/* 입력 제목으로 바로 검색 */}
+            <div className="mb-3 p-3 bg-white border border-blue-200 rounded-lg">
+              <div className="text-xs font-semibold text-slate-500 mb-1">입력 제목</div>
+              <div className="text-sm font-bold text-slate-900 mb-2">{row.title||'(제목 없음)'}</div>
+              <button onClick={()=>doSearch(row.title||'')}
+                disabled={searching}
+                className="w-full px-4 py-2 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 disabled:opacity-40 transition-colors">
+                {searching ? '검색 중...' : '입력 제목으로 바로 검색하기'}
+              </button>
+            </div>
+            <div className="flex gap-2">
+              <input type="text" value={query} onChange={e=>setQuery(e.target.value)}
+                onKeyDown={e=>e.key==='Enter'&&!searching&&doSearch()}
+                placeholder="또는 직접 검색어를 입력하세요..."
+                className="flex-1 text-sm border-2 border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900 placeholder-slate-400" />
+              <button onClick={doSearch} disabled={searching||!query.trim()}
+                className="px-4 py-2 bg-slate-700 text-white text-sm font-bold rounded-lg hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                {searching?'검색 중...':'검색'}
+              </button>
+            </div>
+            {searchErr && <p className="text-sm text-red-600 font-semibold mt-2">{searchErr}</p>}
+            {results.length>0 && (
+              <div className="mt-3 space-y-2">
+                {[...results].sort((a,b)=>(b._score||0)-(a._score||0)).map((item,i) => (
+                  <CandidateCard key={i} candidate={item} onConfirm={()=>onConfirm(item,'수동검색')} />
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ② 검토 사유 */}
+          {row.note && (
+            <div className="bg-orange-100 border-2 border-orange-400 rounded-lg px-4 py-3">
+              <div className="text-sm font-bold text-orange-900 mb-1.5">검토 사유</div>
+              <div className="text-sm text-slate-900 font-medium">{row.note}</div>
+            </div>
+          )}
+
+          {/* ③ 자동 추천 후보 — 60% 이상만 */}
+          {(() => {
+            const highConf = visible.filter(c => pct(c._score) >= 60);
+            return (
+              <div>
+                <h3 className="text-sm font-bold text-slate-800 mb-2">
+                  자동 추천 후보
+                  {isSeriesBook(row.title) && (
+                    <span className="ml-2 text-purple-700 font-semibold">— 권수/상하 반드시 확인</span>
+                  )}
+                </h3>
+                {highConf.length===0 ? (
+                  <div className="border-2 border-dashed border-slate-300 rounded-lg py-6 px-4 text-center text-slate-700 text-sm">
+                    후보가 없습니다. 위 <strong>직접 검색</strong>을 통해 직접 찾아보시는 게 좋겠습니다.
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {highConf.map((cand) => {
+                      const oi = row.candidates.indexOf(cand);
+                      return (
+                        <CandidateCard key={oi} candidate={cand} rank={highConf.indexOf(cand)+1}
+                          onConfirm={()=>onConfirm(cand,'자동매칭')}
+                          onDelete={()=>onDeleteCandidate(oi)} />
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
+          {/* ④ 검토 메모 */}
+          <div className="border-t border-slate-200 pt-4">
+            <h3 className="text-sm font-bold text-slate-800 mb-2">검토 메모</h3>
+            <textarea value={note} onChange={e=>setNote(e.target.value)} onBlur={()=>onUpdateNote(note)}
+              placeholder="검토 내용, 특이사항 메모..."
+              className="w-full text-sm border-2 border-slate-300 rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 text-slate-900 placeholder-slate-400"
+              rows={2} />
+          </div>
+        </div>
+        <div className="px-5 py-3 border-t border-slate-200 flex justify-end bg-slate-50 rounded-b-2xl">
+          <button onClick={()=>{onUpdateNote(note);onClose();}}
+            className="px-5 py-2 border-2 border-slate-400 text-slate-800 text-sm font-semibold rounded-lg hover:bg-slate-100 transition-colors">
+            닫기
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// [§13] BookTable
+// ============================================================
+function BookTable({ rows, onVerify, onOpenReview }) {
+  if (!rows.length) return <div className="text-center py-14 text-slate-400 text-sm">해당 항목이 없습니다.</div>;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <colgroup>
+          <col style={{width:'36px'}} />      {/* # */}
+          <col style={{minWidth:'300px'}} />  {/* 입력 제목 */}
+          <col style={{width:'110px'}} />     {/* 저자 */}
+          <col style={{width:'90px'}} />      {/* 출판사 */}
+          <col style={{width:'70px'}} />      {/* 정가 */}
+          <col style={{width:'138px'}} />     {/* 입력 ISBN */}
+          <col style={{width:'138px'}} />     {/* 확정 ISBN */}
+          <col style={{width:'90px'}} />      {/* 상태 */}
+          <col style={{width:'110px'}} />     {/* 메모 */}
+          <col style={{width:'160px'}} />     {/* 액션 */}
+        </colgroup>
+        <thead>
+          {/* ISBN 링크 안내 */}
+          <tr className="bg-blue-50 border-b border-blue-100">
+            <th colSpan={10} className="px-3 py-1.5 text-left">
+              <span className="text-xs text-blue-700 font-medium">
+                📎 ISBN 숫자를 클릭하면 알라딘 페이지가 새 창으로 열립니다
+              </span>
+            </th>
+          </tr>
+          <tr className="border-b border-slate-100 bg-slate-50/80">
+            {['#','입력 제목','저자','출판사','정가','입력 ISBN','확정 ISBN','상태','메모','액션'].map(h => (
+              <th key={h} className="px-3 py-2.5 text-left text-xs font-semibold text-slate-600 uppercase tracking-wide whitespace-nowrap">{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {rows.map(row => {
+            // ISBN 일치 여부
+            const confirmedIsbn = row.selected?.isbn13 || '';
+            const isbnMismatch  = row.inputIsbn && confirmedIsbn && row.inputIsbn !== confirmedIsbn;
+            // 알라딘 링크
+            const aladinLink = isbn => `https://www.aladin.co.kr/search/wsearchresult.aspx?SearchTarget=Book&SearchWord=${isbn}`;
+            const confirmedLink = row.selected?.link || (confirmedIsbn ? aladinLink(confirmedIsbn) : null);
+            return (
+            <tr key={row.id} className={`hover:bg-blue-50/30 transition-colors ${
+              row.status===ST.REVIEW?'bg-yellow-50/60':row.status===ST.FAILED?'bg-red-50/50':''
+            }`}>
+              {/* # */}
+              <td className="px-3 py-2.5 text-xs text-slate-500 font-mono">{row.id}</td>
+
+              {/* 입력 제목 — 넓게, 말줄임 최소화 */}
+              <td className="px-3 py-2.5">
+                <div className="flex items-start gap-1.5 flex-wrap">
+                  <span className="font-semibold text-slate-900 leading-snug break-words">
+                    {row.title||<span className="text-slate-400">-</span>}
+                  </span>
+                  {isSeriesBook(row.title) && (
+                    <span className="shrink-0 text-[10px] bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded font-medium">시리즈</span>
+                  )}
+                </div>
+              </td>
+
+              {/* 저자 */}
+              <td className="px-3 py-2.5 text-slate-800">
+                <div className="text-xs leading-snug" title={row.author}>{row.author||<span className="text-slate-400">-</span>}</div>
+              </td>
+
+              {/* 출판사 */}
+              <td className="px-3 py-2.5 text-slate-800">
+                <div className="text-xs leading-snug line-clamp-2" title={row.publisher}>{row.publisher||<span className="text-slate-400">-</span>}</div>
+              </td>
+
+              {/* 정가 */}
+              <td className="px-3 py-2.5 text-slate-800 text-xs text-right whitespace-nowrap">{fmtPrice(row.price)}</td>
+
+              {/* 입력 ISBN */}
+              <td className="px-3 py-2.5 font-mono text-xs whitespace-nowrap">
+                {row.inputIsbn ? (
+                  isValidIsbn13(row.inputIsbn) ? (
+                    <a href={aladinLink(row.inputIsbn)} target="_blank" rel="noreferrer"
+                      className={`inline-flex items-center gap-1 underline decoration-dotted hover:decoration-solid ${isbnMismatch ? 'text-red-600 font-bold' : 'text-slate-700 hover:text-blue-700'}`}
+                      title="알라딘에서 검색">
+                      {row.inputIsbn}{isbnMismatch && ' ✕'}
+                      <svg className="w-3 h-3 opacity-60 shrink-0" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+                        <path d="M5 2H2a1 1 0 00-1 1v7a1 1 0 001 1h7a1 1 0 001-1V7M8 1h3m0 0v3m0-3L5 7"/>
+                      </svg>
+                    </a>
+                  ) : (
+                    <span className="text-orange-500 font-bold" title="유효하지 않은 ISBN">{row.inputIsbn} ⚠</span>
+                  )
+                ) : <span className="text-purple-600 font-bold text-xs">ISBN없음</span>}
+              </td>
+
+              {/* 확정 ISBN — 녹색 링크 (입력ISBN 바로 우측) */}
+              <td className="px-3 py-2.5 font-mono text-xs whitespace-nowrap">
+                {confirmedIsbn ? (
+                  <a href={confirmedLink} target="_blank" rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-emerald-600 font-bold underline decoration-dotted hover:decoration-solid hover:text-emerald-700"
+                    title="알라딘 도서 페이지 열기">
+                    {confirmedIsbn}
+                    <svg className="w-3 h-3 opacity-60 shrink-0" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+                      <path d="M5 2H2a1 1 0 00-1 1v7a1 1 0 001 1h7a1 1 0 001-1V7M8 1h3m0 0v3m0-3L5 7"/>
+                    </svg>
+                  </a>
+                ) : <span className="text-slate-400">-</span>}
+              </td>
+
+              {/* 상태 (확정ISBN 우측) */}
+              <td className="px-3 py-2.5 whitespace-nowrap"><RowStatusBadge row={row} /></td>
+
+              {/* 메모 — 주의사항·특이사항만 표시 */}
+              <td className="px-3 py-2.5" style={{maxWidth:'110px'}}>
+                {(() => {
+                  const n = row.note;
+                  // 정상 확정 루틴 메시지는 조용히 숨김
+                  const isSilent = !n
+                    || /^ISBN 직접 조회 확정$/.test(n)
+                    || /^자동매칭 확정 \(/.test(n)
+                    || /^시리즈 매칭 자동확정 \(/.test(n);
+                  if (isSilent) return <span className="text-slate-300 text-xs">-</span>;
+                  // 색상: 심각도 순
+                  let cls = 'text-slate-700';
+                  if (row.status === ST.FAILED) cls = 'text-red-600 font-semibold';
+                  else if (row.status === ST.REVIEW || /⚠|불일치|확인 필요|직접 선택|직접 검색/.test(n)) cls = 'text-amber-700 font-semibold';
+                  else if (/^\[수동/.test(n)) cls = 'text-indigo-700';
+                  return (
+                    <div className={`text-xs leading-snug line-clamp-2 ${cls}`} title={n}>
+                      {n}
+                    </div>
+                  );
+                })()}
+              </td>
+
+              {/* 액션 */}
+              <td className="px-3 py-2.5 whitespace-nowrap">
+                <div className="flex flex-col gap-0.5 items-start">
+                  <div className="flex gap-1 items-center">
+                    <button onClick={()=>onVerify(row.id)} disabled={row.loading}
+                      className="px-2.5 py-1 text-xs border border-slate-300 text-slate-600 rounded-md hover:bg-slate-100 disabled:opacity-40 transition-colors font-medium">재검증</button>
+                    {(row.status===ST.REVIEW||row.status===ST.FAILED) ? (
+                      <button onClick={()=>onOpenReview(row.id)}
+                        className="btn-review px-3 py-1.5 text-xs font-bold bg-green-500 border-2 border-green-600 text-white rounded-lg hover:bg-green-600 transition-colors whitespace-nowrap">
+                        ★ 수동 검토하기
+                      </button>
+                    ) : (
+                      <button onClick={()=>onOpenReview(row.id)}
+                        className="px-2.5 py-1 text-xs bg-slate-50 border border-slate-200 text-slate-600 rounded-md hover:bg-slate-100 transition-colors">검토</button>
+                    )}
+                  </div>
+                  {/* 재검증 피드백 */}
+                  {row.loading ? (
+                    <span className="text-[11px] text-blue-500 animate-pulse pl-0.5">검증 중...</span>
+                  ) : row.reVerifyCount > 0 ? (() => {
+                    const s = row.status;
+                    if (s===ST.ACCURATE||s===ST.CONFIRMED)
+                      return <span className="text-[11px] text-emerald-600 font-semibold pl-0.5">✓ 확정 완료</span>;
+                    if (s===ST.REVIEW)
+                      return <span className="text-[11px] text-amber-600 font-semibold pl-0.5">⚠ 검토 필요</span>;
+                    if (s===ST.FAILED)
+                      return <span className="text-[11px] text-red-500 font-semibold pl-0.5">✗ 확정 실패</span>;
+                    return null;
+                  })() : null}
+                </div>
+              </td>
+            </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ============================================================
+// [§13-B] 처리 완료 브리핑 패널
+// ============================================================
+function BriefingPanel({ rows, briefing, onClose }) {
+  if (!briefing) return null;
+  const processed = rows.filter(r => r.processingMs !== null && r.processingMs !== undefined);
+  if (!processed.length) return null;
+
+  // 유형별 집계
+  const byType = {};
+  for (const row of processed) {
+    const rt = getResultType(row);
+    if (!byType[rt]) byType[rt] = { count:0, totalMs:0 };
+    byType[rt].count++;
+    byType[rt].totalMs += row.processingMs;
+  }
+
+  const totalMs = processed.reduce((s,r) => s + (r.processingMs||0), 0);
+  const wallSec = (briefing.wallMs / 1000).toFixed(1);
+  const avgSec  = processed.length ? (totalMs / processed.length / 1000).toFixed(1) : '-';
+
+  const fmtSec = ms => (ms/1000).toFixed(1)+'초';
+
+  const ORDER = [RT.ISBN_DIRECT, RT.SEARCH_MATCH, RT.ISBN_CORRECT, RT.SERIES_MATCH, RT.MANUAL, RT.REVIEW, RT.FAILED];
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm fadein">
+      <div className="flex items-center justify-between px-5 py-3 border-b border-slate-100">
+        <div>
+          <span className="text-sm font-bold text-slate-800">처리 완료 브리핑</span>
+          <span className="ml-2 text-xs text-slate-400">{briefing.completedAt?.toLocaleTimeString('ko-KR')}</span>
+        </div>
+        <button onClick={onClose} className="text-slate-300 hover:text-slate-500 text-lg font-bold px-1">×</button>
+      </div>
+      <div className="px-5 py-4">
+        {/* 총계 요약 */}
+        <div className="flex gap-6 mb-4 pb-3 border-b border-slate-100 text-xs">
+          <div><span className="text-slate-400">처리 건수</span> <span className="font-bold text-slate-700 ml-1">{processed.length}건</span></div>
+          <div><span className="text-slate-400">총 소요 (실시간)</span> <span className="font-bold text-slate-700 ml-1">{wallSec}초</span></div>
+          <div><span className="text-slate-400">건당 평균 소요</span> <span className="font-bold text-slate-700 ml-1">{avgSec}초</span></div>
+        </div>
+        {/* 유형별 테이블 */}
+        <div className="space-y-1.5">
+          {ORDER.map(rt => {
+            const d = byType[rt];
+            if (!d) return null;
+            const cfg = RT_CFG[rt];
+            const avg = fmtSec(d.totalMs / d.count);
+            const pct = Math.round(d.count / processed.length * 100);
+            return (
+              <div key={rt} className="flex items-center gap-3 text-xs">
+                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-bold w-36 shrink-0 ${cfg.bg} ${cfg.color}`}>
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`}></span>
+                  {cfg.label}
+                </span>
+                <div className="flex-1 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                  <div className={`h-full rounded-full ${cfg.dot}`} style={{width:`${pct}%`}}></div>
+                </div>
+                <span className="text-slate-500 w-10 text-right shrink-0">{d.count}건</span>
+                <span className="text-slate-400 w-12 text-right shrink-0">평균 {avg}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// [§14] 배너들
+// ============================================================
+
+/** file:// 프로토콜 안내 배너 (항상 표시) */
+function FileProtocolBanner() {
+  const [off, setOff] = useState(false);
+  if (!IS_FILE || off) return null;
+  return (
+    <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 flex items-start gap-3 fadein">
+      <div className="text-amber-500 shrink-0 font-bold mt-0.5">!</div>
+      <div className="flex-1">
+        <div className="text-sm font-semibold text-amber-800 mb-1">
+          file:// 프로토콜 — JSONP + CORS 프록시 동시 레이스 모드
+        </div>
+        <div className="text-xs text-amber-700 space-y-1">
+          <div>ISBN 있는 행: 직접 JSONP 조회 (항상 안정). ISBN 없는 행: <strong>JSONP와 CORS 프록시를 동시에 시도</strong>, 먼저 응답 오는 것 사용.</div>
+          <div className="font-semibold text-amber-800">가장 안정적인 방법 (검색 100% 보장) — 터미널에서 아래 한 줄 실행 후 브라우저 접속:</div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <code className="bg-amber-100 font-mono px-2 py-1 rounded text-xs">python3 -m http.server 8080</code>
+            <span className="text-amber-600">→</span>
+            <code className="font-mono text-xs">http://localhost:8080/isbn-verifier.html</code>
+          </div>
+        </div>
+      </div>
+      <button onClick={()=>setOff(true)} className="text-amber-400 hover:text-amber-600 font-bold text-lg shrink-0">×</button>
+    </div>
+  );
+}
+
+/** 실패 건수 안내 배너 */
+function ApiFailBanner({ count }) {
+  const [off, setOff] = useState(false);
+  if (count < 1 || IS_FILE || off) return null; // file:// 에선 이미 위 배너가 있으므로 중복 안 띄움
+  return (
+    <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-start gap-3 fadein">
+      <div className="text-red-500 shrink-0 font-bold mt-0.5">!</div>
+      <div className="flex-1 text-sm text-red-700">
+        <span className="font-semibold">API 호출 실패 {count}건.</span>{' '}
+        네트워크 연결 또는 알라딘 API 상태를 확인해주세요.
+      </div>
+      <button onClick={()=>setOff(true)} className="text-red-400 hover:text-red-600 font-bold text-lg shrink-0">×</button>
+    </div>
+  );
+}
+
+// ============================================================
+// [§15] App
+// ============================================================
+function App() {
+  const [rows,       setRows]       = useState([]);
+  const [tab,        setTab]        = useState('all');
+  const [reviewId,   setReviewId]   = useState(null);
+  const [threshold,  setThreshold]  = useState(DEFAULT_THRESHOLD);
+  const [processing, setProcessing] = useState(false);
+  const [briefing,   setBriefing]   = useState(null);
+  const [uploadErr,  setUploadErr]  = useState(null);
+  const fileRef = useRef(null);
+
+  const patch = useCallback((id, updates) => {
+    setRows(prev => prev.map(r => r.id===id ? {...r,...updates} : r));
+  }, []);
+
+  const applyParsed = (result, filename) => {
+    setUploadErr(null);
+    if (!result || result.err) {
+      const ERR_MSG = {
+        EMPTY:        `"${filename}" 파일이 비어 있습니다.`,
+        NO_DATA:      `"${filename}" 헤더 행만 있고 데이터 행이 없습니다.`,
+        HTML_NO_TABLE:`"${filename}" HTML 파일에서 <table> 태그를 찾을 수 없습니다.`,
+        HTML_PARSE_ERR:`"${filename}" HTML 파싱 중 오류가 발생했습니다.`,
+        NO_COLUMNS:   `"${filename}" 에서 인식 가능한 칼럼을 찾지 못했습니다.\n\n발견된 헤더: ${result?.foundHeaders||'(헤더 없음)'}\n\n필요한 칼럼(한 가지 이상):\n· 제목/도서명/상품명 — 책 이름\n· ISBN/ISBN13/바코드 — 국제 도서 번호\n· 저자/저자명/아티스트 — 저자\n· 출판사/제작사 — 출판사\n· 정가/가격/판매가 — 가격\n\n칼럼명을 위 형식 중 하나로 수정 후 다시 업로드해주세요.`,
+      };
+      setUploadErr(ERR_MSG[result?.err] || `"${filename}" 파일을 처리할 수 없습니다.`);
+      return;
+    }
+    if (!result.rows.length) {
+      setUploadErr(`"${filename}" 에서 데이터 행을 찾을 수 없습니다.`);
+      return;
+    }
+    if (result.guessed) {
+      setUploadErr(`⚠ 헤더를 인식하지 못해 AI가 칼럼을 자동 추론했습니다. 데이터를 꼭 확인해주세요. (${result.rows.length}건 로드)`);
+    }
+    setRows(result.rows); setTab('all'); setReviewId(null); setBriefing(null);
+  };
+
+  const onFile = useCallback((e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const ext = file.name.split('.').pop().toLowerCase();
+    setUploadErr(null);
+
+    if (ext === 'html' || ext === 'htm') {
+      // HTML 파일: 텍스트로 읽어 DOMParser로 테이블 추출
+      const r = new FileReader();
+      r.onload = ev => applyParsed(parseHtmlContent(ev.target.result), file.name);
+      r.readAsText(file, 'utf-8');
+    } else if (ext === 'csv' || ext === 'txt' || ext === 'tsv') {
+      // 텍스트 계열: UTF-8 → EUC-KR 폴백
+      const r = new FileReader();
+      r.onload = ev => {
+        let text = ev.target.result;
+        // 깨진 문자가 많으면 EUC-KR 재시도
+        if ((text.match(/\uFFFD/g)||[]).length > 5) {
+          const r2 = new FileReader();
+          r2.onload = ev2 => applyParsed(parseTextContent(new TextDecoder('euc-kr').decode(ev2.target.result)), file.name);
+          r2.readAsArrayBuffer(file);
+        } else {
+          applyParsed(parseTextContent(text), file.name);
+        }
+      };
+      r.readAsText(file, 'utf-8');
+    } else {
+      // XLS / XLSX — 바이너리 시그니처로 진짜/가짜 판별
+      const r = new FileReader();
+      r.onload = ev => {
+        const data = new Uint8Array(ev.target.result);
+        if (isRealBinaryOffice(data)) {
+          // 정상 엑셀 바이너리
+          try {
+            const wb = XLSX.read(data, {type:'array'});
+            const ws = wb.Sheets[wb.SheetNames[0]];
+            applyParsed(parseSheet(ws), file.name);
+          } catch(err) {
+            setUploadErr(`엑셀 파일을 열 수 없습니다: ${err.message}`);
+          }
+        } else {
+          // 가짜 XLS(실제는 텍스트/HTML) — EUC-KR 우선 시도
+          let text;
+          try { text = new TextDecoder('euc-kr').decode(data); } catch(_) {}
+          if (!text) text = new TextDecoder('utf-8', {fatal:false}).decode(data);
+          // HTML 구조면 HTML 파서, 아니면 텍스트 파서
+          if (text.trimStart().startsWith('<')) {
+            applyParsed(parseHtmlContent(text), file.name);
+          } else {
+            applyParsed(parseTextContent(text), file.name);
+          }
+        }
+      };
+      r.readAsArrayBuffer(file);
+    }
+    e.target.value = '';
+  }, []);
+
+  const loadSample = () => { setRows(SAMPLE.map(r=>({...r}))); setTab('all'); setReviewId(null); };
+
+  const verifyOne = useCallback(async (id) => {
+    const row = rows.find(r => r.id===id);
+    if (!row || row.loading) return;
+    patch(id, {loading:true, status:ST.LOADING});
+    try {
+      const result = await runVerify(row, threshold);
+      patch(id, {...result, loading:false, reVerifyCount:(row.reVerifyCount||0)+1});
+    } catch (e) {
+      patch(id, {loading:false, status:ST.FAILED, note:String(e.message), reVerifyCount:(row.reVerifyCount||0)+1});
+    }
+  }, [rows, threshold, patch]);
+
+  const verifyAll = useCallback(async () => {
+    const targets = rows.filter(r => r.status===ST.PENDING || r.status===ST.FAILED);
+    if (!targets.length) return;
+    setProcessing(true);
+
+    // 동시 3개 처리 / 배치 간 300ms
+    const CONCURRENCY = 3;
+    const BATCH_DELAY = 300;
+    // 행당 최대 15초 하드 타임아웃 — 어떤 상황에서도 이 시간 안에 완료/실패 확정
+    const ROW_TIMEOUT_MS = 15000;
+
+    const wallStart = Date.now();
+
+    const runOne = async (row) => {
+      const rowStart = Date.now();
+      patch(row.id, {loading:true, status:ST.LOADING});
+      const timeoutPromise = new Promise((_, rej) =>
+        setTimeout(() => rej(new Error('ROW_TIMEOUT')), ROW_TIMEOUT_MS)
+      );
+      try {
+        const result = await Promise.race([runVerify(row, threshold), timeoutPromise]);
+        patch(row.id, {...result, loading:false, processingMs: Date.now() - rowStart});
+      } catch (e) {
+        const note = e.message === 'ROW_TIMEOUT'
+          ? `검증 시간 초과 (${ROW_TIMEOUT_MS/1000}초). "검토" 버튼으로 직접 찾아보세요.`
+          : String(e.message);
+        patch(row.id, {loading:false, status:ST.FAILED, note, processingMs: Date.now() - rowStart});
+      }
+    };
+
+    for (let i = 0; i < targets.length; i += CONCURRENCY) {
+      const batch = targets.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map(runOne));
+      if (i + CONCURRENCY < targets.length) await delay(BATCH_DELAY);
+    }
+
+    const wallMs = Date.now() - wallStart;
+    setProcessing(false);
+    setBriefing(prev => ({ wallMs, completedAt: new Date(), prevWallMs: prev?.wallMs ?? null }));
+  }, [rows, threshold, patch]);
+
+  const stats = useMemo(() => {
+    const total     = rows.length;
+    const confirmed = rows.filter(r=>r.status===ST.ACCURATE||r.status===ST.CONFIRMED).length;
+    const review    = rows.filter(r=>r.status===ST.REVIEW).length;
+    const failed    = rows.filter(r=>r.status===ST.FAILED).length;
+    const pending   = rows.filter(r=>r.status===ST.PENDING).length;
+    const apiFail   = rows.filter(r=>r.status===ST.FAILED&&isApiErr(r.note)).length;
+    const rate      = total>0 ? Math.round(confirmed/total*100) : 0;
+    return {total,confirmed,review,failed,pending,apiFail,rate};
+  }, [rows]);
+
+  const displayRows = useMemo(() => {
+    let base;
+    if      (tab==='review') base = rows.filter(r=>r.status===ST.REVIEW);
+    else if (tab==='failed') base = rows.filter(r=>r.status===ST.FAILED);
+    else                     base = [...rows];
+    return base.sort((a,b) => (SORT_PRI[a.status]??9)-(SORT_PRI[b.status]??9));
+  }, [rows, tab]);
+
+  const reviewRow = useMemo(
+    () => (reviewId!=null ? rows.find(r=>r.id===reviewId)??null : null),
+    [rows, reviewId]
+  );
+
+  const dlAll = () => {
+    // 화면에 보이는 순서(displayRows) 그대로 엑셀에 반영
+    toExcel(displayRows, makeFilename(displayRows));
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      {/* 헤더 */}
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
+        <div className="max-w-screen-xl mx-auto px-5 py-3 flex items-center justify-between gap-4">
+          <div>
+            <h1 className="text-base font-bold text-slate-900">도서 리스트 ISBN 자동 확보/검증 AI</h1>
+            <p className="text-xs text-slate-400">엑셀 업로드 → 자동 검증 → 후보 확인 → 확정 파일 다운로드</p>
+          </div>
+          {null /* 다운로드 버튼은 테이블 상단으로 이동 */}
+        </div>
+      </header>
+
+      <main className="max-w-screen-xl mx-auto px-5 py-4 space-y-4">
+        <FileProtocolBanner />
+        <ApiFailBanner count={stats.apiFail} />
+
+        {/* 컨트롤 바 */}
+        <div className="bg-white rounded-xl border border-slate-200 px-4 py-3 flex flex-wrap items-center gap-3">
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,.tsv,.txt,.html,.htm" onChange={onFile} className="hidden" />
+          <button onClick={()=>fileRef.current?.click()}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-semibold hover:bg-blue-700 transition-colors">
+            엑셀 파일 업로드
+          </button>
+          {rows.length>0 && (
+            <>
+              <div className="h-5 w-px bg-slate-200" />
+              <button onClick={verifyAll} disabled={processing||stats.pending+stats.failed===0}
+                className={`px-7 py-2.5 text-white rounded-xl text-base font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed
+                  ${!processing && stats.pending+stats.failed>0
+                    ? 'btn-verify-active bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 shadow-md hover:shadow-lg'
+                    : 'bg-emerald-600 hover:bg-emerald-700'}`}>
+                {processing
+                  ? <span className="flex items-center gap-2"><svg className="spin h-4 w-4" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" opacity="0.25"/><path fill="currentColor" opacity="0.75" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg> 검증 처리 중...</span>
+                  : `▶ 미처리 ${stats.pending+stats.failed}건 검증 시작`}
+              </button>
+              <ThresholdInfo threshold={threshold} onChange={setThreshold} />
+            </>
+          )}
+        </div>
+
+        {/* 파일 업로드 오류 */}
+        {uploadErr && (
+          <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-start gap-3 fadein">
+            <div className="text-red-500 shrink-0 font-bold mt-0.5 text-lg">!</div>
+            <div className="flex-1 text-xs text-red-700 whitespace-pre-line">{uploadErr}</div>
+            <button onClick={()=>setUploadErr(null)} className="text-red-300 hover:text-red-500 font-bold text-lg shrink-0">×</button>
+          </div>
+        )}
+
+        {/* 처리 완료 브리핑 패널 */}
+        {briefing && !processing && rows.length>0 && (
+          <BriefingPanel rows={rows} briefing={briefing} onClose={()=>setBriefing(null)} />
+        )}
+
+        {/* 요약 카드 */}
+        {rows.length>0 && (
+          <div className="grid grid-cols-5 gap-3">
+            <SummaryCard label="전체"      value={stats.total}     color="gray"   />
+            <SummaryCard label="확정 완료" value={stats.confirmed} color="green"  />
+            <SummaryCard label="검토 필요" value={stats.review}    color="yellow" />
+            <SummaryCard label="실패"      value={stats.failed}    color="red"    />
+            <SummaryCard label="확정률"    value={`${stats.rate}%`} color="blue"  />
+          </div>
+        )}
+
+        {/* 테이블 */}
+        {rows.length>0 && (
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+            {/* 탭 + 엑셀 다운로드 버튼 (테이블 맨 위 중앙) */}
+            <div className="flex items-center border-b border-slate-100 bg-slate-50/60 gap-2 px-2">
+              <div className="flex flex-1">
+                {[
+                  {key:'all',    label:`전체 (${rows.length})`},
+                  {key:'review', label:`검토필요 (${stats.review})`},
+                  {key:'failed', label:`실패 (${stats.failed})`},
+                ].map(t => (
+                  <button key={t.key} onClick={()=>setTab(t.key)}
+                    className={`px-5 py-2.5 text-sm font-medium transition-colors border-b-2 ${
+                      tab===t.key
+                        ? 'border-blue-600 text-blue-600 bg-white'
+                        : 'border-transparent text-slate-500 hover:text-slate-700'
+                    }`}>
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <button onClick={dlAll}
+                className={`mx-auto px-6 py-2.5 bg-gradient-to-r from-green-600 to-emerald-600 text-white text-sm font-extrabold rounded-xl shadow-md hover:from-green-700 hover:to-emerald-700 transition-all whitespace-nowrap${!processing && stats.confirmed > 0 && stats.pending === 0 ? ' btn-excel-active' : ''}`}>
+                ↓ 이 결과를 엑셀로 받기
+              </button>
+              <div className="w-4"/>
+            </div>
+            <BookTable rows={displayRows} onVerify={verifyOne} onOpenReview={setReviewId} />
+          </div>
+        )}
+
+        {/* 빈 상태 */}
+        {rows.length===0 && (
+          <div className="text-center py-20 text-slate-400">
+            <div className="w-16 h-16 mx-auto mb-5 rounded-2xl bg-slate-100 flex items-center justify-center">
+              <svg className="w-8 h-8 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+            </div>
+            <p className="text-base font-semibold text-slate-500">엑셀 파일을 업로드해주세요</p>
+            <p className="text-sm mt-1">지원 형식: .xlsx · .xls · .csv</p>
+            <p className="text-xs mt-2 text-slate-300">컬럼명: 제목/도서명 · 저자 · 출판사 · 정가 · ISBN</p>
+          </div>
+        )}
+      </main>
+
+      {/* 검토 모달 */}
+      {reviewRow && (
+        <ReviewModal row={reviewRow}
+          onClose={()=>setReviewId(null)}
+          onConfirm={(cand,method) => {
+            patch(reviewRow.id, {
+              selected:{...cand,_method:method},
+              status:ST.CONFIRMED,
+              note:`[${method}] ${cand.title} / ISBN ${cand.isbn13}`,
+            });
+            setReviewId(null);
+          }}
+          onDeleteCandidate={oi=>patch(reviewRow.id,{
+            deletedCandidateIndexes:[...reviewRow.deletedCandidateIndexes,oi],
+          })}
+          onUpdateNote={note=>patch(reviewRow.id,{note})} />
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
