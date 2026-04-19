@@ -30,12 +30,12 @@ exports.handler = async (event) => {
 
   try {
     const body = await new Promise((resolve, reject) => {
-      https.get(url, {
+      const req = https.get(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (compatible; ISBN-Checker/1.0)',
           'Accept': '*/*',
         },
-        timeout: 12000,
+        timeout: 8000,  // Netlify 무료 플랜 실행 한도(10s) 이내로 설정
       }, (res) => {
         const chunks = [];
         res.on('data', d => chunks.push(d));
@@ -45,7 +45,12 @@ exports.handler = async (event) => {
           const match = raw.match(/^[^(]*\((.+)\);?\s*$/s);
           resolve(match ? match[1] : raw);
         });
-      }).on('error', reject).on('timeout', () => reject(new Error('TIMEOUT')));
+      });
+      req.on('error', reject);
+      req.on('timeout', () => {
+        req.destroy(); // 소켓 강제 종료 (누락 시 함수가 Netlify 한도까지 점유)
+        reject(new Error('TIMEOUT'));
+      });
     });
 
     return {
